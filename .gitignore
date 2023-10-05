@@ -1,1 +1,9 @@
+# DS store
 .DS_Store
+
+# Virtual Environment
+rclif_env/
+
+# Data and Output Directories
+data/
+output/
