@@ -1,0 +1,17 @@
+#!/bin/bash
+#SBATCH --job-name=sipa_clean
+#SBATCH --time=00:30:00
+#SBATCH --partition=wparker-hm
+#SBATCH --account=pi-wparker
+#SBATCH --qos=wparker
+#SBATCH --nodes=1
+
+module load python/anaconda-2022.05
+source activate pyspark_env
+module load java
+module load spark
+
+python /home/rbaccile/Desktop/clif/CLIF/sipa_code_cleaning/cohort_identification.py
+python /home/rbaccile/Desktop/clif/CLIF/sipa_code_cleaning/worst_labs_48.py
+python /home/rbaccile/Desktop/clif/CLIF/sipa_code_cleaning/worst_vitals_48.py
+python /home/rbaccile/Desktop/clif/CLIF/sipa_code_cleaning/SIPA_analytic_df_.py

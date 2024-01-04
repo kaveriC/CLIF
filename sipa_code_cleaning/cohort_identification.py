@@ -289,6 +289,25 @@ df = df.withColumn("fio2_filled",df.fio2_filled.cast('double'))
 df = df.withColumn("pao2_filled",df.pao2_filled.cast('double'))
 df = df.withColumn("spO2_filled",df.spO2_filled.cast('double'))
 
+# Get first time on oxygen support & P/F <200
+df = df.withColumn("p_f", f.expr(
+        """
+        CASE
+        WHEN fio2_filled IS NOT NULL AND pao2_filled IS NOT NULL THEN ( pao2_filled / fio2_filled )
+        ELSE NULL
+        END
+        """
+    ))
+
+df = df.withColumn("s_f", f.expr(
+        """
+        CASE
+        WHEN fio2_filled IS NOT NULL AND spO2_filled IS NOT NULL THEN ( spO2_filled / fio2_filled )
+        ELSE NULL
+        END
+        """
+    ))
+
 df = df.distinct()
 df.write.parquet("/project2/wparker/SIPA_data/p_f_combined_filled.parquet", mode="overwrite")
 
