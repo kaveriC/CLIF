@@ -14,4 +14,4 @@ module load spark
 python /home/rbaccile/Desktop/clif/CLIF/sipa_code_cleaning/cohort_identification.py
 python /home/rbaccile/Desktop/clif/CLIF/sipa_code_cleaning/worst_labs_48.py
 python /home/rbaccile/Desktop/clif/CLIF/sipa_code_cleaning/worst_vitals_48.py
-python /home/rbaccile/Desktop/clif/CLIF/sipa_code_cleaning/SIPA_analytic_df_.py
+python /home/rbaccile/Desktop/clif/CLIF/sipa_code_cleaning/SIPA_analytic_df.py
