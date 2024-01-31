@@ -1,0 +1,88 @@
+---
+title: "RCLIF_labs"
+output: html_document
+date: "2023-07-03"
+author: Kaveri Chhikara
+---
+```{r}
+library(tidyverse)
+library(bigreadr)
+library(lubridate)
+library(openxlsx)
+library(readxl)
+library(arrow)
+```
+
+## Load data
+
+```{r}
+labs_cri_filepath <- "/Users/kavenchhikara/Desktop/RCLIF/data/C19_LAB_LDS.txt"
+limited_vocab_lab_names <- "/Users/kavenchhikara/Desktop/RCLIF/data/labs_limited_vocab.xlsx"
+```
+
+```{r load_labs}
+# This takes about 3 minutes
+labs_all <- big_fread1(file = labs_cri_filepath, every_nlines=10000000)
+```
+```{r}
+labs_all %>% filter(component_id == 3191) %>% view()
+```
+
+```{r}
+names(labs_all)
+```
+
+
+
+```{r}
+rclif_limited_vocab_labs <- read_excel(limited_vocab_lab_names)
+```
+
+#### RCLIF labs schema 
+Obtaining relevant lab names from raw data 
+
+```{r}
+reqd_labs <- labs_all %>% 
+  left_join(rclif_limited_vocab_labs, by = "component_name") %>% 
+  filter(!is.na(lab_name))
+```
+
+## Creating one Long table
+
+```{r}
+lab_rclif <- reqd_labs %>% 
+  mutate(lab_result_time = format(as.POSIXct(result_time, origin = "1970-01-01"),  "%Y-%m-%d %H:%M:%S"), 
+         lab_order_time = format(as.POSIXct(order_time, origin = "1970-01-01"),  "%Y-%m-%d %H:%M:%S")) %>% 
+  rename(lab_value = ord_value) %>% 
+  arrange(C19_PATIENT_ID, lab_result_time) %>% 
+  select(C19_PATIENT_ID, C19_HAR_ID, lab_order_time,lab_result_time, lab_group, 
+         proc_name, lab_name,component_name, lab_value, reference_value,
+         reference_unit, lab_type_name)
+``` 
+
+## Check for duplicates
+ 
+```{r}
+# Check for duplicate rows in the data frame
+# fromLast = TRUE argument returns a logical vector with TRUE for all rows that are duplicates except for their last occurrences
+# duplicates <- duplicated(lab_rclif) | duplicated(lab_rclif, fromLast = TRUE)
+# # Show the duplicate rows
+# duplicate_rows <- lab_rclif[duplicates, ]
+# print(duplicate_rows)
+```
+
+```{r}
+labs_no_duplicates <- subset(lab_rclif, !duplicated(lab_rclif))
+```
+
+## write parquet
+
+```{r}
+write_parquet(labs_no_duplicates,"/Users/kavenchhikara/Desktop/RCLIF/output/RCLIF_labs.parquet")
+```
+
+## write csv
+
+```{r write_csv}
+write.csv(labs_no_duplicates, file="/Users/kavenchhikara/Desktop/RCLIF/output/RCLIF_labs.csv")
+```

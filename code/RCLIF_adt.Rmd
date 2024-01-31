@@ -1,0 +1,108 @@
+---
+title: "RCLIF_ADT"
+output: html_document
+date: "2023-07-05"
+author: Kaveri Chhikara
+---
+
+```{r}
+library(tidyverse)
+library(bigreadr)
+library(arrow)
+```
+
+
+## Load data
+
+```{r filepath}
+adt_path <- "/Users/kavenchhikara/Desktop/RCLIF/data/C19_ADT_LDS.txt"
+```
+
+```{r}
+c19_adt  <- big_fread1(file = adt_path, every_nlines=10000000)
+```
+
+```{r}
+names(c19_adt)
+```
+
+```{r adt_clean}
+# Clean identifier variables
+rclif_adt <- c19_adt %>%
+  mutate(in_time = as.double(as.POSIXct(in_time, format = "%Y-%m-%d %H:%M:%S"))) %>%
+  filter(!is.na(as.numeric(C19_PATIENT_ID)) & !is.na(as.numeric(C19_HAR_ID)) & !is.na(in_time)) %>% 
+  mutate(dept_name = case_when(
+      str_detect(adt_department_name, "^N08S") |
+      str_detect(adt_department_name, "^N0[8-9][E/W]") |
+      str_detect(adt_department_name, "^N03[N/S/W]") |
+      str_detect(adt_department_name, "^N04[N/S/W]") |
+      str_detect(adt_department_name, "^N10[E/W]") |
+      str_detect(adt_department_name, "^T[3-6][N/S][E/W]") |
+      str_detect(adt_department_name, "^T3NO") 
+      ~ "Ward",
+      
+      str_detect(adt_department_name, "^D[2-6]IC") |
+      str_detect(adt_department_name, "^(N08N|N09N|N09S)") |
+      str_detect(adt_department_name, "^N08S") |
+      str_detect(adt_department_name, "^N03[E/B]") |
+      str_detect(adt_department_name, "^N04E") |
+      str_detect(adt_department_name, "^N10[N/S]") |
+      str_detect(adt_department_name, "^T6IC") |
+      grepl("ICU", adt_department_name)
+      ~ "ICU", 
+      
+      str_detect(adt_department_name, "CD MAIN OR|DCAM MAIN OR|COMER MAIN OR") 
+      ~ "OR",
+      
+      str_detect(adt_department_name, "ED CCD|ER COMER|BIER|ER MITCHELL") 
+      ~ "ER"
+  ),
+  room_name = case_when(
+    str_detect(adt_room_nm_wid, "^(0|8|9)(0)[0-9][0-9]") |
+    str_detect(adt_room_nm_wid, "^100(3[3-9]|4[0-4])") |
+    str_detect(adt_room_nm_wid, "^100(7[7-9]|80)")  |
+    str_detect(adt_room_nm_wid, "^100*") |
+    str_detect(adt_room_nm_wid, "^30(0[1-9]|1[0-9]|2[0-9]|3[0-9]|4[0-7]|6[3-9]|7[0-9]|8[0-4])") |
+    str_detect(adt_room_nm_wid, "^34(8[1-6])") |
+    str_detect(adt_room_nm_wid, "^35(2[1-5]|3[1-6])") |
+    str_detect(adt_room_nm_wid, "^40(0[2-9]|1[0-9]|2[0-9]|3[0-9]|4[0-3]|7[2-9]|8[0-4])") |
+    str_detect(adt_room_nm_wid, "^44(8[1-6])") |
+    str_detect(adt_room_nm_wid, "^45(2[1-5]|3[1-6])") |
+    str_detect(adt_room_nm_wid, "^80(7[7-9]|8[0-8])") |
+    str_detect(adt_room_nm_wid, "^T[N/S][3-6][0-9][0-9]") ~ "Ward",
+
+    str_detect(adt_room_nm_wid, "^100(3[3-9]|4[0-4])") |
+    str_detect(adt_room_nm_wid, "^100(7[7-9]|80)") |
+    str_detect(adt_room_nm_wid, "^30(4[8-9]|5[0-9]|6[0-7])") |
+    str_detect(adt_room_nm_wid, "^40(4[4-9]|5[0-9]|6[0-9]|7[0-1])") |
+    str_detect(adt_room_nm_wid, "^80(3[3-9]|4[0-4])") |
+    str_detect(adt_room_nm_wid, "^80(7[7-9]|8[0-8])") |
+    str_detect(adt_room_nm_wid, "^90(3[3-9]|4[0-4]|7[7-9]|8[0-8])") |
+    str_detect(adt_room_nm_wid, "^D[2-6][0-2][0-9]") |
+    str_detect(adt_room_nm_wid, "^TS6[0-2][0-9]") ~ "ICU",
+    
+    adt_room_nm_wid %in% c("OTFA", "OTFP") |
+    str_detect(adt_room_nm_wid, "^[N/E/S/W][0-3][0-9] ") |
+    str_detect(adt_room_nm_wid, "\\bEXAM\\b|\\bTRAUMA\\b") ~ "ER"
+  ),
+  start_time = format(as.POSIXct(in_time, origin = "1970-01-01"),  "%Y-%m-%d %H:%M:%S"),
+  end_time = format(as.POSIXct(out_time, origin = "1970-01-01"),  "%Y-%m-%d %H:%M:%S") 
+  ) %>% 
+  select(C19_PATIENT_ID, C19_HAR_ID, start_time, end_time, adt_department_name,adt_room_nm_wid, dept_name, room_name ) %>% 
+  arrange(C19_PATIENT_ID, start_time) 
+```
+
+
+## write parquet
+
+```{r}
+write_parquet(rclif_adt,"/Users/kavenchhikara/Desktop/RCLIF/output/RCLIF_adt.parquet")
+```
+
+## write csv
+
+```{r}
+write.csv(rclif_adt, file="/Users/kavenchhikara/Desktop/RCLIF/output/RCLIF_adt.csv")
+```
+
+

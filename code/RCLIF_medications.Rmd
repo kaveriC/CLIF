@@ -1,0 +1,209 @@
+---
+title: "RCLIF_medication"
+output: html_document
+date: "2023-07-05"
+author: Kaveri Chhikara
+---
+
+```{r}
+library(tidyverse)
+library(bigreadr)
+library(readxl)
+library(arrow)
+library(stringr)
+# library(vtable)
+```
+
+```{r}
+medadmin_filepath <- "/Users/kavenchhikara/Desktop/RCLIF/data/C19_RX_ADMIN_LDS.txt"
+medorders_filepath <- "/Users/kavenchhikara/Desktop/RCLIF/data/C19_RX_ORDER_LDS.txt"
+limited_vocab_meds_filepath <- "/Users/kavenchhikara/Desktop/RCLIF/data/meds_limited_vocab.xlsx"
+med_out_filepath <- "/Users/kavenchhikara/Desktop/RCLIF/data/C19_RX_OUT_LDS.txt"
+```
+
+```{r load_medications}
+medadmin <- big_fread1(file=medadmin_filepath, every_nlines=10000000, data.table = TRUE)
+medorders <- big_fread1(file= medorders_filepath, every_nlines=10000000, data.table = TRUE)
+med_out <- big_fread1(file=med_out_filepath, 
+                      every_nlines=10000000, data.table = TRUE)
+```
+
+## Limited vocab for vitals
+
+```{r}
+rclif_limited_vocab_meds <- read_excel(limited_vocab_meds_filepath)
+```
+
+## Medication_orders RCLIF table
+
+```{r}
+med_out_subset <- med_out %>% 
+  select(C19_PATIENT_ID, C19_HAR_ID,MED_ID , ORDER_START_TIME,
+                   ORDER_END_TIME,MEDICATION, MED_ROUTE, QUANTITY) %>% 
+  rename(order_start_dttm = ORDER_START_TIME,
+        order_end_dttm = ORDER_END_TIME,
+        medication_name = MEDICATION, 
+        med_route = MED_ROUTE,
+        quantity = QUANTITY,
+        medication_id =MED_ID ) %>% 
+  arrange(C19_PATIENT_ID, C19_HAR_ID,order_start_dttm, order_end_dttm)
+```
+
+```{r}
+medication_orders <- medorders %>% 
+  select(C19_PATIENT_ID, C19_HAR_ID, medication_id, order_start_time, order_end_time,
+         medication_name, order_med_freq, dose, dose_units) %>% 
+  rename(order_start_dttm = order_start_time,
+         order_end_dttm = order_end_time,
+         med_dose = dose,
+         med_dose_units = dose_units,
+         med_frequency = order_med_freq) %>% 
+  arrange(C19_PATIENT_ID, C19_HAR_ID,order_start_dttm, order_end_dttm) %>% 
+  left_join(med_out_subset, by = c("C19_PATIENT_ID","C19_HAR_ID","medication_id",
+                                   "order_start_dttm", "medication_name")) %>% 
+  select(C19_PATIENT_ID, C19_HAR_ID, medication_id, order_start_dttm, order_end_dttm.x,
+         medication_name, med_route, med_dose, med_dose_units, med_frequency) %>% 
+  rename(order_end_dttm = order_end_dttm.x,
+         encounter_id = C19_HAR_ID,
+         med_name = medication_name, 
+         patient_id = C19_PATIENT_ID)
+```
+Pending
+* Remove C19_PATIENT_ID
+* remove medication_id
+* generate a new variable for med_order_id
+* confirm what to do with  PRN variable
+
+
+
+## write csv and parquet
+
+```{r}
+## medication orders
+write_parquet(medication_orders,"/Users/kavenchhikara/Desktop/RCLIF/output/RCLIF_medication_orders.parquet")
+write.csv(medication_orders, file="/Users/kavenchhikara/Desktop/RCLIF/output/RCLIF_medication_orders.csv")
+```
+
+
+## Medication_admin_continuous
+
+## get list of all med names and med ids
+```{r}
+## med names and categories decided for all continuous meds
+meds_filepath <- "/Users/kavenchhikara/Desktop/RCLIF/data/all_conti_meds_limited_vocab.xlsx"
+rclif_meds <- read_excel(meds_filepath)
+```
+
+```{r}
+all_med_names <- medadmin %>% 
+  select(medication_id, medication_name, order_med_freq) %>% 
+  distinct()
+```
+
+```{r}
+# This function will detect if the required med_name is in the medication_name
+# \\b is a regular expression for a word boundary. It ensures that the match must occur at the start and end of a word. 
+# match_meds <- function(med_name, medication_name) {
+#   pattern <- paste0("\\b", med_name, "\\b")
+#   str_detect(medication_name, regex(pattern, ignore_case = TRUE))
+# }
+
+match_meds <- function(med_name, medication_name) {
+  # Split the medication_name into words and take the first two
+  first_two_words <- sapply(str_split(medication_name, " "), function(words) paste(words[1:min(2, length(words))], collapse = " "))
+  
+  # Create a regex pattern for exact word match
+  pattern <- paste0("\\b", med_name, "\\b")
+  
+  # Check if the pattern is found in the first two words
+  str_detect(first_two_words, regex(pattern, ignore_case = TRUE))
+}
+
+matched_df <- rclif_meds %>%
+  rowwise() %>%
+  mutate(matched_med = list(all_med_names[match_meds(med_name, all_med_names$medication_name), ])) %>%
+  unnest(matched_med)
+
+med_names_mapped <- matched_df %>% 
+  filter(grepl("CONTINUOUS", order_med_freq))
+```
+
+
+```{r}
+reqd_meds <- medadmin %>% 
+  select(-c(prescript_sig, prescript_quantity, prescript_refills, mar_action, ordering_mode, rxnorm_code)) %>% 
+  mutate(admin_dttm = format(as.POSIXct(take_med_dttm, origin = "1970-01-01"),  "%Y-%m-%d %H:%M:%S"),
+         order_start_time = format(as.POSIXct(order_start_time, origin = "1970-01-01"),  "%Y-%m-%d %H:%M:%S"),
+         order_end_time = format(as.POSIXct(order_end_time, origin = "1970-01-01"),  "%Y-%m-%d %H:%M:%S"),
+         med_dose_unit = str_trim(ifelse(is.na(dose_units) | dose_units == "", str_replace_all(take_med_dose, "[0-9.]+", ""), dose_units)),
+         med_dose =str_extract_all(take_med_dose, "[-+]?[0-9]*\\.?[0-9]+([eE][-+]?[0-9]+)?") %>%
+                                    sapply(function(x) if(length(x) > 0) paste(x, collapse = "") else NA_character_)) %>% 
+  filter(grepl("min|hr|day", med_dose_unit, ignore.case = TRUE)) %>%
+  rename(order_start_dttm = order_start_time) %>% 
+  mutate(order_start_dttm = ymd_hms(order_start_dttm)) %>% 
+  left_join(med_out_subset, by = c("C19_PATIENT_ID","C19_HAR_ID","medication_id",
+                                   "order_start_dttm", "medication_name")) %>% 
+  semi_join(med_names_mapped, by = "medication_name") %>% 
+  select(C19_PATIENT_ID, C19_HAR_ID, admin_dttm, medication_name, 
+          med_route, med_dose, med_dose_unit) 
+```
+
+```{r}
+meds_continuous <- reqd_meds %>% 
+  left_join(med_names_mapped, by = "medication_name") %>% 
+  select(-c(order_med_freq, medication_id)) %>% 
+  arrange(C19_PATIENT_ID, C19_HAR_ID, admin_dttm) %>% 
+  rename(encounter_id = C19_HAR_ID) %>% 
+  select(C19_PATIENT_ID, encounter_id,admin_dttm, 
+         med_name, med_route, med_category, med_dose, 
+         med_dose_unit)
+```
+
+```{r}
+names(reqd_meds2)
+```
+
+## write csv and parquet
+
+```{r}
+write_parquet(meds_continuous,"/Users/kavenchhikara/Desktop/RCLIF/output/RCLIF_medication_admin_continuous.parquet")
+write.csv(meds_continuous, file="/Users/kavenchhikara/Desktop/RCLIF/output/RCLIF_medication_admin_continuous.csv")
+```
+
+## Medication_admin_intermittent
+
+```{r}
+meds_intermittent <- medadmin %>% 
+  select(-c(prescript_sig, prescript_quantity, prescript_refills, mar_action, ordering_mode, rxnorm_code)) %>% 
+  mutate(admin_dttm = format(as.POSIXct(take_med_dttm, origin = "1970-01-01"),  "%Y-%m-%d %H:%M:%S"),
+         order_start_time = format(as.POSIXct(order_start_time, origin = "1970-01-01"),  "%Y-%m-%d %H:%M:%S"),
+         order_end_time = format(as.POSIXct(order_end_time, origin = "1970-01-01"),  "%Y-%m-%d %H:%M:%S"),
+         med_dose_unit = str_trim(ifelse(is.na(dose_units) | dose_units == "", str_replace_all(take_med_dose, "[0-9.]+", ""), dose_units)),
+         med_dose =str_extract_all(take_med_dose, "[-+]?[0-9]*\\.?[0-9]+([eE][-+]?[0-9]+)?") %>%
+                                    sapply(function(x) if(length(x) > 0) paste(x, collapse = "") else NA_character_)) %>% 
+  filter(!grepl("min|hr|day", med_dose_unit, ignore.case = TRUE) & !grepl("CONTINUOUS", order_med_freq)) %>%
+  rename(order_start_dttm = order_start_time) %>% 
+  mutate(order_start_dttm = ymd_hms(order_start_dttm)) %>% 
+  left_join(med_out_subset, by = c("C19_PATIENT_ID","C19_HAR_ID","medication_id",
+                                   "order_start_dttm", "medication_name")) %>% 
+  semi_join(med_names_mapped, by = "medication_name") #%>% 
+  #select(C19_PATIENT_ID, C19_HAR_ID, admin_dttm, medication_name, med_route, med_dose, med_dose_unit) 
+  
+```
+
+
+
+```{r}
+intermittent_meds_names <- meds_intermittent %>% select(medication_name) %>% distinct()
+write.csv(intermittent_meds_names, file="/Users/kavenchhikara/Desktop/RCLIF/output/intermittent_meds_names.csv")
+```
+
+## write csv and parquet
+
+```{r}
+write_parquet(meds_intermittent,"/Users/kavenchhikara/Desktop/RCLIF/output/RCLIF_medication_admin_intermittent.parquet")
+write.csv(meds_intermittent, file="/Users/kavenchhikara/Desktop/RCLIF/output/RCLIF_medication_admin_intermittent.csv")
+```
+
+
+

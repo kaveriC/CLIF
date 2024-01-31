@@ -1,0 +1,47 @@
+---
+title: "RCLIF_admission_diagnosis"
+output: html_document
+date: "2023-11-07"
+author: Kaveri Chhikara
+---
+```{r}
+library(tidyverse)
+library(bigreadr)
+library(digest)
+library(readxl)
+library(arrow)
+```
+
+## Load data
+
+```{r}
+diagnosis_cri_filepath <- "/Users/kavenchhikara/Desktop/RCLIF/data/C19_DX_LDS.txt"
+# limited_vocab_lab_names <- "/Users/kavenchhikara/Desktop/RCLIF/data/labs_limited_vocab.xlsx"
+```
+
+```{r load_labs}
+dx_all <- big_fread1(file = diagnosis_cri_filepath, every_nlines=10000000)
+```
+
+## Create admission diagnosis table 
+
+```{r}
+rclif_admission_diagnosis <- dx_all %>% 
+  select(C19_PATIENT_ID, C19_HAR_ID, dx_name, icd10_code, poa) %>% 
+  rename(diagnosis_name = dx_name, 
+         dianosis_code = icd10_code,
+         pta = poa) %>% 
+  arrange(C19_PATIENT_ID, C19_HAR_ID)
+```
+
+## write parquet
+
+```{r}
+write_parquet(rclif_admission_diagnosis,"/Users/kavenchhikara/Desktop/RCLIF/output/RCLIF_admission_diagnosis.parquet")
+```
+
+## write csv
+
+```{r write_csv}
+write.csv(rclif_admission_diagnosis, file="/Users/kavenchhikara/Desktop/RCLIF/output/RCLIF_admission_diagnosis.csv")
+```

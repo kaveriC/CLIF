@@ -1,0 +1,294 @@
+---
+title: "RCLIF_vitals"
+output: html_document
+date: "2023-07-03"
+author: Kaveri Chhikara
+---
+
+```{r}
+library(tidyverse)
+library(bigreadr)
+library(digest)
+library(readxl)
+library(arrow)
+```
+
+```{r filepath}
+vitals_flowsheet_path <- "/Users/kavenchhikara/Desktop/RCLIF/data/C19_FLOW_LDS_part1.txt"
+vitals_flowsheet2_path <- "/Users/kavenchhikara/Desktop/RCLIF/data/C19_FLOW_LDS_part2.txt"
+limited_vocab_vitals_filepath <- "/Users/kavenchhikara/Desktop/RCLIF/data/vitals_limited_vocab.xlsx"
+```
+
+```{r load_vitals_in}
+vitals_flowsheet  <- big_fread1(file = vitals_flowsheet_path, every_nlines=10000000)
+vitals_flowsheet2 <- big_fread1(file = vitals_flowsheet2_path, every_nlines=10000000)
+all_vitals <- rbind(vitals_flowsheet, vitals_flowsheet2)
+rm(vitals_flowsheet)
+rm(vitals_flowsheet2)
+```
+
+## Limited vocab for vitals
+
+```{r}
+rclif_limited_vocab_vitals <- read_excel(limited_vocab_vitals_filepath)
+```
+
+#### RCLIF vitals schema 
+Obtaining relevant lab names from raw data 
+
+```{r}
+reqd_vitals <- all_vitals %>% 
+  left_join(rclif_limited_vocab_vitals, by = "flo_meas_name") %>% 
+  filter(!is.na(vital_name))
+```
+
+```{r}
+bp_df <- reqd_vitals %>%
+  filter(vital_name == "blood_pressure") %>% 
+  separate(`meas_value`, sep = "/", c("sbp", "dbp")) %>%
+  select(C19_PATIENT_ID, C19_HAR_ID,recorded_time, sbp, dbp, meas_site_name) %>%
+  pivot_longer(cols = -c(C19_PATIENT_ID, C19_HAR_ID, recorded_time,  meas_site_name), names_to = "vital_name", values_to = "vital_value") %>%
+  select(C19_PATIENT_ID, C19_HAR_ID,recorded_time, vital_name, vital_value,  meas_site_name)
+```
+
+```{r}
+vitals_rclif <- reqd_vitals %>% 
+  filter(vital_name != "blood_pressure") %>% 
+  select(C19_PATIENT_ID, C19_HAR_ID, recorded_time, vital_name, meas_value,  meas_site_name) %>% 
+  rename(vital_value = meas_value) %>% 
+  bind_rows(bp_df) %>% 
+  mutate(recorded_time = format(as.POSIXct(recorded_time, origin = "1970-01-01"),  "%Y-%m-%d %H:%M:%S")) %>% 
+  arrange(C19_HAR_ID, recorded_time)
+```
+
+## write parquet
+
+```{r}
+write_parquet(vitals_rclif,"/Users/kavenchhikara/Desktop/RCLIF/output/RCLIF_vitals.parquet")
+```
+
+## write csv
+
+```{r write_csv}
+write.csv(vitals_rclif, file="/Users/kavenchhikara/Desktop/RCLIF/output/RCLIF_vitals.csv")
+```
+
+```{r}
+rm(bp_df)
+rm(reqd_vitals)
+rm(vitals_rclif)
+rm(rclif_limited_vocab_vitals)
+```
+
+## Respiratory support and Vent settings- Wide table
+
+```{r}
+#mode_name and mode_category mapping file
+limited_vocab_rs_filepath <- "/Users/kavenchhikara/Desktop/RCLIF/data/mode_name_category_limited_vocab.xlsx"
+```
+
+## Limited vocab for vitals
+
+```{r}
+rclif_limited_vocab_rs <- read_excel(limited_vocab_rs_filepath)
+```
+
+```{r}
+reqd_flo_names <- c("RT RS OXYGEN DEVICE",
+              "RT RS VENT FIO2",
+             "RT RS FIO2",
+              "RT RS NI FIO2",
+             "RT RS OXYGEN FLOW",
+             "RT RS VENT PRESSURES PEEP/CPAP",
+             "RT RS VENT VOLUMES VT SET",
+             "RT RS VENT PRESSURE PRESSURE SUPPORT",
+             "RT RS CONVENTIONAL VENT MODES",
+             "RT RS RESP RATE SET")
+
+wide_rs_vs <- all_vitals %>% 
+  filter(flo_meas_name %in% c(reqd_flo_names)) %>%
+  select(C19_PATIENT_ID, C19_HAR_ID, recorded_time, flo_meas_name, meas_value) %>%
+  pivot_wider(names_from = flo_meas_name, values_from = meas_value) %>%
+  mutate(recorded_time = format(as.POSIXct(recorded_time, origin = "1970-01-01"),  "%Y-%m-%d %H:%M:%S")) %>% 
+  arrange(C19_PATIENT_ID, recorded_time)
+```
+
+```{r}
+rclif_rs_vs <- wide_rs_vs %>% 
+  rename(o2_device = `RT RS OXYGEN DEVICE`,
+         peep = `RT RS VENT PRESSURES PEEP/CPAP`,
+       set_volume  = `RT RS VENT VOLUMES VT SET`,
+       mode_name  = `RT RS CONVENTIONAL VENT MODES`,
+       pressure_support  = `RT RS VENT PRESSURE PRESSURE SUPPORT`,
+       set_resp_rate = `RT RS RESP RATE SET`) %>%
+  full_join(rclif_limited_vocab_rs, by = "mode_name") %>% 
+  mutate(device_name = case_when(
+          is.na(o2_device) ~ NA_character_,
+           grepl('Vent', o2_device) ~ 'Vent',
+           grepl('Bipap', o2_device) ~ 'NIPPV',
+           grepl('CPAP', o2_device) ~ 'NIPPV',
+           grepl('High Flow NC', o2_device) ~ 'High Flow NC',
+           grepl('Mask', o2_device) ~ 'Face Mask',
+           grepl('Trach Collar', o2_device) ~ 'Trach Collar',
+           grepl('Cannula', o2_device) ~ 'Nasal Cannula',
+           grepl('Room Air', o2_device) ~ 'Room Air',
+           TRUE ~ "Other"),
+         lpm = case_when(
+           is.na(`RT RS OXYGEN FLOW`) == FALSE ~ as.numeric(`RT RS OXYGEN FLOW`)),
+         #fix errors in lpm
+         lpm = case_when(
+          lpm < 0 ~ NA_real_,
+          device_name == 'Room Air' ~ NA_real_,
+          device_name == 'Vent' ~ NA_real_,
+          device_name == 'Bipap' ~ NA_real_,
+          device_name == 'CPAP' ~ NA_real_,
+          device_name == 'Trach Collar' ~ NA_real_,
+          device_name == 'Nasal Cannula' & lpm > 6 ~ 6,
+          device_name == 'High Flow' & lpm > 60 ~ 60,
+          lpm > 60 ~ NA_real_,
+          TRUE ~ lpm),
+        high_flow = grepl("High Flow",  device_name), 
+        bipap = grepl("Bipap", device_name),
+        cpap = grepl("CPAP", device_name),
+        vent = grepl("Vent", device_name),
+        fi_o2_combine = case_when(
+            is.na(`RT RS FIO2`)  == FALSE ~ `RT RS FIO2`,
+            is.na(`RT RS VENT FIO2`) == FALSE ~ `RT RS VENT FIO2`,
+            is.na(`RT RS NI FIO2`) == FALSE ~`RT RS NI FIO2`),
+        fio2 = as.numeric(fi_o2_combine)/100,
+        recorded_time = format(as.POSIXct(recorded_time, origin = "1970-01-01"),  "%Y-%m-%d %H:%M:%S")
+  ) %>%
+  group_by(C19_PATIENT_ID, C19_HAR_ID) %>%
+  fill(mode_name,device_name, mode_category, .direction = "downup") %>% 
+  select(C19_PATIENT_ID, C19_HAR_ID, recorded_time, device_name,
+         mode_name,mode_category, set_volume, pressure_support, set_resp_rate,  
+         lpm, fio2, peep) %>%
+  arrange(C19_PATIENT_ID, recorded_time)
+```
+
+```{r}
+wide_rs_vs %>% 
+  rename(o2_device = `RT RS OXYGEN DEVICE`) %>%
+  mutate(device_name = case_when(
+          is.na(o2_device) ~ NA_character_,
+           grepl('Vent', o2_device) ~ 'Vent',
+           grepl('Bipap', o2_device) ~ 'NIPPV',
+           grepl('CPAP', o2_device) ~ 'NIPPV',
+           grepl('High Flow NC', o2_device) ~ 'High Flow NC',
+           grepl('Mask', o2_device) ~ 'Face Mask',
+           grepl('Trach Collar', o2_device) ~ 'Trach Collar',
+           grepl('Cannula', o2_device) ~ 'Nasal Cannula',
+           grepl('Room Air', o2_device) ~ 'Room Air',
+           TRUE ~ "Other")) %>% 
+  
+```
+
+
+
+## write parquet
+
+```{r}
+write_parquet(rclif_rs_vs,"/Users/kavenchhikara/Desktop/RCLIF/output/RCLIF_resp_support.parquet")
+```
+
+## write csv
+
+```{r write_csv}
+write.csv(rclif_rs_vs, file="/Users/kavenchhikara/Desktop/RCLIF/output/RCLIF_resp_support.csv")
+```
+
+## Descriptive stats
+
+
+```{r}
+#read in the data
+resp_support_filepath <- "/Users/kavenchhikara/Desktop/RCLIF/output/RCLIF_resp_support.parquet"
+resp_support_parquet_data <- read_parquet(resp_support_filepath)
+```
+
+```{r}
+resp_filter <- resp_support_parquet_data %>%
+  mutate(
+    recorded_time = as.POSIXct(recorded_time, format = "%Y-%m-%d %H:%M:%S"),
+    set_volume = as.numeric(set_volume),
+    pressure_support = as.numeric(pressure_support),
+    set_resp_rate = as.numeric(set_resp_rate),
+    peep = as.numeric(peep)) %>% 
+  filter(recorded_time >= as.POSIXct("2020-03-01 00:00:00") &
+                          recorded_time < as.POSIXct("2022-04-01 00:00:00")) %>% 
+  arrange(C19_PATIENT_ID, recorded_time)
+```
+
+```{r}
+resp_filter %>% filter(!is.na(device_name)) %>% group_by(device_name) %>%  count(device_name) %>% arrange(desc(n))
+```
+
+```{r}
+resp_filter %>% filter(!is.na(mode_name)) %>% group_by(mode_name) %>%  count() %>% arrange(desc(n))
+```
+
+
+
+```{r}
+summary(resp_filter)
+```
+```{r}
+# Assuming resp_filter is your data frame
+missing_values <- colSums(is.na(resp_filter))
+
+# Calculate missing percentage
+missing_percentage <- (missing_values / nrow(resp_filter)) * 100
+
+# Create a data frame
+missing_data_summary <- data.frame(
+  names = names(resp_filter),
+  missing_percentage = missing_percentage
+)
+
+# Print the result
+print(missing_data_summary)
+
+```
+
+
+```{r}
+resp_filter %>% filter(!is.na(fio2) & is.na(device_name)) %>%  view()
+```
+
+
+```{r}
+resp_filter %>%
+  filter(fio2 < 100 & peep < 100 & pressure_support < 100 & set_resp_rate < 100 & set_volume <= 2000) %>% 
+  gather(key = "variable", value = "value", -c(C19_PATIENT_ID, C19_HAR_ID, recorded_time, device_name, mode_name, mode_category)) %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30, fill = "blue", color = "black") +
+  facet_wrap(~ variable, scales = "free") +
+  labs(x = "Value",
+       y = "Frequency")
+```
+
+
+
+```{r}
+resp_filter %>%
+  # filter(fio2 < 100 & peep < 100 & pressure_support < 50 & set_resp_rate < 100 & set_volume <= 2000) %>% 
+  gather(key = "variable", value = "value", -c(C19_PATIENT_ID, C19_HAR_ID, recorded_time, device_name, mode_name, mode_category)) %>%
+  ggplot(aes(x = value)) +
+  geom_boxplot() +
+  facet_wrap(~ variable, scales = "free") 
+```
+
+
+```{r}
+resp_filter %>% group_by(set_resp_rate) %>% count()
+```
+
+
+## check instances when fio2 exists but device_name is NA
+```{r}
+check <- resp_filter %>% filter(!is.na(fio2) & is.na(device_name))
+```
+
+```{r}
+main_df_check <- all_vitals %>% filter(C19_PATIENT_ID == 6914 & flo_meas_name == "RT RS OXYGEN DEVICE")
+```

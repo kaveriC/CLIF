@@ -1,0 +1,171 @@
+---
+title: "RCLIF_demographics"
+output: html_document
+date: "2023-10-20"
+author: Kaveri Chhikara
+---
+
+```{r}
+library(tidyverse)
+library(bigreadr)
+library(readxl)
+library(arrow)
+```
+
+## Load data
+
+```{r}
+demo_filepath <- "/Users/kavenchhikara/Desktop/RCLIF/data/C19_PATIENT_DEMO_LDS.txt"
+dispo_filepath <- "/Users/kavenchhikara/Desktop/RCLIF/data/C19_ENC_XTRA_LDS.txt"
+enc_filepath <- "/Users/kavenchhikara/Desktop/RCLIF/data/C19_ENC_LDS.txt"
+zipcode_filepath <- "/Users/kavenchhikara/Desktop/RCLIF/data/C19_PATIENT_ZIP_CODE_LDS.txt"
+```
+
+```{r load_demographics_data, eval = FALSE}
+demo <- big_fread1(file=demo_filepath, every_nlines=10000000)
+dispo <- big_fread1(file= dispo_filepath, every_nlines=10000000)
+encounters_id <- big_fread1(file= enc_filepath, every_nlines=10000000)
+zipcodes <- big_fread1(file= zipcode_filepath, every_nlines=10000000)
+```
+
+```{r}
+demographics_required <- demo %>% 
+  select(C19_PATIENT_ID,  birth_date, sex, race, ethnic) %>% 
+  mutate(birth_date = format(as.POSIXct(birth_date, origin = "1970-01-01"),  "%Y-%m-%d %H:%M:%S")) %>% 
+  rename(ethnicity = ethnic)
+
+disposition_reqd <- dispo %>% 
+  filter(record_type == "hb") %>% 
+  select(C19_PATIENT_ID, C19_HAR_ID, discharge_dispo) %>% 
+  arrange(C19_PATIENT_ID, C19_HAR_ID)
+
+enc_reqd <- encounters_id %>% 
+  filter(record_type == "hb") %>% 
+  select(C19_PATIENT_ID, C19_HAR_ID, adm_date, disc_date) %>% 
+  mutate(adm_date = format(as.POSIXct(adm_date, origin = "1970-01-01"),  "%Y-%m-%d %H:%M:%S"),
+         disc_date = format(as.POSIXct(disc_date, origin = "1970-01-01"),  "%Y-%m-%d %H:%M:%S")) %>%
+  arrange(C19_PATIENT_ID, C19_HAR_ID) 
+```
+
+
+## RCLIF patient demographics 
+```{r}
+rclif_patient_demo <-  demographics_required %>% 
+  select(C19_PATIENT_ID, race, ethnicity, sex) %>% 
+  mutate(race_new = case_when(
+           is.na(race) ~ NA_character_,
+           race %in% c("Black or African-American") ~ "Black or African-American",
+           race %in% c("White") ~ "White",
+           race %in% c("American Indian or Alaska Native") ~ "American Indian or Alaska Native",
+           race %in% c("Asian Indian", "Asian/Mideast Indian", 
+                       "Other Asian") ~ "Asian",
+           race %in% c("Native Hawaiian", 
+                       "Native Hawaiian/Other Pacific Islander", 
+                       "Other Pacific Islander") ~ "Native Hawaiian or Other Pacific Islander",
+           race %in% c("Patient declines to respond", 
+                       "Unknown or Patient unable to respond") ~ "Unknown",
+           TRUE ~ "Other"),
+         ethnicity_new = case_when(
+           is.na(race) ~ NA_character_,
+           ethnicity %in% c("Hispanic or Latino", 
+                            "Mexican, Mexican American, or Chicano/a") ~ "Hispanic",
+           ethnicity %in% c("Not Hispanic, Latino/a, or Spanish origin", 
+                            "Other Hispanic, Latino/a, or Spanish origin") ~ "Not Hispanic",
+           ethnicity %in% c("Patient declines to respond", 
+                            "Puerto Rican", 
+                            "Unknown or Patient unable to respond") ~ "Unknown")) %>% 
+  select(-c(race, ethnicity)) %>% 
+  rename(race = race_new,
+         ethnicity= ethnicity_new) %>% 
+  arrange(C19_PATIENT_ID)
+```
+
+## write csv and parquet
+
+```{r}
+write_parquet(rclif_patient_demo,"/Users/kavenchhikara/Desktop/RCLIF/output/RCLIF_patient_demographics.parquet")
+write.csv(rclif_patient_demo, file="/Users/kavenchhikara/Desktop/RCLIF/output/RCLIF_patient_demographics.csv")
+```
+
+## RCLIF Limited identifiers table
+
+```{r}
+rclif_limited_identifiers <- enc_reqd %>% 
+  select(C19_PATIENT_ID,C19_HAR_ID, adm_date, disc_date) %>%
+  left_join(demographics_required, by="C19_PATIENT_ID") %>%
+  left_join(zipcodes, by = "C19_PATIENT_ID") %>% 
+  select(C19_PATIENT_ID,C19_HAR_ID, adm_date, disc_date, birth_date, zip_code) %>% 
+  rename(admission_date = adm_date,
+         discharge_date = disc_date)
+```
+
+## write csv and parquet
+
+```{r}
+write_parquet(rclif_limited_identifiers,"/Users/kavenchhikara/Desktop/RCLIF/output/RCLIF_limited_identifers.parquet")
+write.csv(rclif_limited_identifiers, file="/Users/kavenchhikara/Desktop/RCLIF/output/RCLIF_limited_identifers.csv")
+```
+
+## Calculate age as of admission
+
+```{r}
+demographics_age <- enc_reqd %>% 
+  select(C19_PATIENT_ID,C19_HAR_ID, adm_date) %>%
+  left_join(demographics_required, by="C19_PATIENT_ID") %>% 
+  drop_na(adm_date) %>% 
+  mutate(adm_date = as.Date(adm_date),
+         birth_date = as.Date(birth_date),
+         age_at_adm = interval(birth_date, adm_date) %/% years(1)) %>% 
+  # select(-c(adm_date, birth_date)) %>% 
+  arrange(C19_PATIENT_ID, C19_HAR_ID)
+```
+
+# Add disposition data
+
+```{r disposition definitions}
+#Definitions
+home_categories <- c("Discharged/transferred to Home Under Care of Organized Home Health Service Org",
+                     "Discharged to Home or Self Care (Routine Discharge)",
+                     "Left Against Medical Advice or Discontinued Care",
+                     "Left before treatment complete",
+                     "Left without being seen")
+
+death_categories <- c("Expired")
+
+hospice_categories <- c("Hospice - Home",
+             "Hospice - Medical Facility (Certified) Providing Hospice Level of Care")
+
+admitted_categories <- c("Admitted as an Inpatient to this Hospital",
+                         "Still Patient")
+```
+
+```{r}
+demo_age_dispo <- disposition_reqd %>% 
+  mutate(disposition_name = case_when(
+    discharge_dispo %in% death_categories ~ "Dead",
+    discharge_dispo %in% hospice_categories ~ "Hospice",
+    discharge_dispo %in% home_categories ~ "Home",
+    grepl("^Discharged/transferred to", discharge_dispo) ~ "Discharged to another facility",
+    discharge_dispo %in% "Disch/trans to Another Type of Health Care Inst not Defined Elsewhere in this List" ~ "Discharged to another facility",
+    discharge_dispo %in% admitted_categories ~ "Admitted",
+    TRUE ~ "Other"  # This will catch all other cases not matching the above conditions. This includes missing values, and Error on Registrations
+  )) %>% 
+  select(-c(discharge_dispo)) %>% 
+  left_join(demographics_age, by= c("C19_PATIENT_ID", "C19_HAR_ID")) %>% 
+  arrange(C19_PATIENT_ID, C19_HAR_ID)
+```
+
+```{r}
+rclif_enc_demo_dispo <- demo_age_dispo %>% 
+  select(C19_PATIENT_ID, C19_HAR_ID, age_at_adm, disposition_name) %>% 
+  rename(age_at_admission = age_at_adm,
+         disposition = disposition_name)
+```
+
+## write csv and parquet
+
+```{r}
+write_parquet(rclif_enc_demo_dispo,"/Users/kavenchhikara/Desktop/RCLIF/output/RCLIF_encounter_demographics_dispo.parquet")
+write.csv(rclif_enc_demo_dispo, file="/Users/kavenchhikara/Desktop/RCLIF/output/RCLIF_encounter_demographics_dispo.csv")
+```
+

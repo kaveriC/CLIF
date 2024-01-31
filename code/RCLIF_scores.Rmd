@@ -1,0 +1,94 @@
+---
+title: "RCLIF_vitals"
+output: html_document
+date: "2023-07-03"
+author: Kaveri Chhikara
+---
+
+```{r}
+library(tidyverse)
+library(bigreadr)
+library(digest)
+library(readxl)
+library(arrow)
+library(stringr)
+```
+
+
+```{r filepath}
+vitals_flowsheet_path <- "/Users/kavenchhikara/Desktop/RCLIF/data/C19_FLOW_LDS_part1.txt"
+vitals_flowsheet2_path <- "/Users/kavenchhikara/Desktop/RCLIF/data/C19_FLOW_LDS_part2.txt"
+```
+
+```{r load_vitals_in, eval=FALSE}
+vitals_flowsheet  <- big_fread1(file = vitals_flowsheet_path, every_nlines=10000000)
+vitals_flowsheet2 <- big_fread1(file = vitals_flowsheet2_path, every_nlines=10000000)
+all_vitals <- rbind(vitals_flowsheet, vitals_flowsheet2)
+rm(vitals_flowsheet)
+rm(vitals_flowsheet2)
+```
+
+
+#### RCLIF scores
+Obtaining relevant lab names from raw data 
+
+Limited vocab-
+GCS-eye, verbal, motor
+RASS- Richmond Agitation-Sedation Scale. It is a tool used to assess a patient's level of sedation and agitation in critical care settings.,
+CAM-ICU- Confusion Assessment Method for the Intensive Care Unit. It is a tool used to identify delirium in critically ill patients.
+Braden- Braden Scale for Predicting Pressure Sore Risk. It is a tool used to assess a patient's risk of developing pressure ulcers (bedsores) based on various factors, including mobility, sensory perception, moisture, activity, nutrition, and friction/shear.
+
+```{r}
+score_names <- c("NUR RA GLASGOW ADULT SCORING",
+                 "NUR RA GLASGOW ADULT BEST MOTOR RESPONSE",
+                 "NUR RA GLASGOW ADULT EYE OPENING",
+                 "NUR RA GLASGOW ADULT VERBAL RESPONSE")
+```
+
+```{r}
+rclif_scores <- all_vitals %>% 
+  filter(flo_meas_name %in% c(score_names)) %>%
+  select(C19_PATIENT_ID, C19_HAR_ID, recorded_time, flo_meas_name, meas_value) %>%
+  mutate(recorded_time = format(as.POSIXct(recorded_time, origin = "1970-01-01"),  "%Y-%m-%d %H:%M:%S")) %>% 
+  rename(score_time = recorded_time,
+         score_name = flo_meas_name,
+         score_value = meas_value) %>% 
+  arrange(C19_PATIENT_ID, score_time)
+```
+
+## write csv and parquet
+
+```{r}
+write.csv(rclif_scores, file="/Users/kavenchhikara/Desktop/RCLIF/output/RCLIF_scores.csv")
+```
+
+```{r}
+write_parquet(rclif_scores,"/Users/kavenchhikara/Desktop/RCLIF/output/RCLIF_scores.parquet")
+```
+
+
+
+# Checks
+```{r}
+names(all_vitals)
+```
+
+```{r}
+all_vitals %>% filter(str_detect(flo_meas_name, regex("RASS", ignore_case = TRUE))) %>% count(flo_meas_name)
+```
+
+## Calculate sofa neuro
+
+
+
+```{r}
+rclif_scores_sofa <- rclif_scores %>% 
+  mutate(sofa_neuro = case_when(
+           as.numeric(`NUR RA GLASGOW ADULT SCORING`) < 6 ~ 4,
+           as.numeric(`NUR RA GLASGOW ADULT SCORING`) < 10 ~ 3,
+           as.numeric(`NUR RA GLASGOW ADULT SCORING`) < 13 ~ 2,
+           as.numeric(`NUR RA GLASGOW ADULT SCORING`) < 15 ~ 1,
+           as.numeric(`NUR RA GLASGOW ADULT SCORING`) == 15 ~ 0
+         )) 
+```
+
