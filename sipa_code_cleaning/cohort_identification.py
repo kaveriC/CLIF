@@ -1,66 +1,114 @@
 #######  Set up spark session ##############
+import os
 import pyarrow as pa
 import pyarrow.parquet as pq
 from pyspark.sql import SparkSession
 import pyspark.sql.functions as f
 from pyspark import SparkConf
 from pyspark.sql.window import Window
-
+spark.sql("set spark.sql.legacy.timeParserPolicy=LEGACY")
+spark.sql("set spark.sql.autoBroadcastJoinThreshold = -1")
 
 
 print("loaded libraries")
 spark = SparkSession.builder \
         .appName("cohort identification") \
+        .config("spark.driver.memory", "15G") \
         .getOrCreate()
 #############################################
+######## Set directory ######## 
+#############################################
+path = "/project2/wparker/SIPA_data/"
+os.chdir(r'/project2/wparker/SIPA_data/')
+print(os.chdir)
 
-######## Load in encounter dataset
-demo_disp = spark.read.parquet("/project2/wparker/SIPA_data/RCLIF_patient_enc_demo_dispo.parquet")
-demo_disp = demo_disp.withColumn('adm_date',f.to_date('adm_date','yyyy-MM-dd'))
 
-# Filter to time period, adults only
+#############################################
+######## Identify Cohort ########
+#############################################
+# Load in limited IDs for admission dates in time period
+limited_ids = spark.read.parquet("RCLIF_limited_identifers.parquet")
+limited_ids = limited_ids.select('encounter_id', 'admission_dttm', 'discharge_dttm', 'zip_code').distinct()
 
-demo_disp = demo_disp.filter(((f.col('adm_date')>='2020-03-01') & 
-                   (f.col('adm_date')<='2022-03-31')))
-demo_disp = demo_disp.filter(f.col('age_at_adm')>=18)
+# Filter to time period
+limited_ids = limited_ids.filter(((f.col('admission_dttm')>='2020-03-01') & 
+                   (f.col('admission_dttm')<='2022-03-31')))
+limited_ids = limited_ids.filter((f.col('discharge_dttm')>=f.col('admission_dttm')))
+limited_ids = limited_ids.filter(f.col('discharge_dttm').isNotNull())
+limited_ids = limited_ids.filter(f.col('admission_dttm').isNotNull())
+
+
+# Load in encounters for age and discharge disposition
+demo_disp = spark.read.parquet("RCLIF_encounter_demographics_dispo.parquet")
+demo_disp = demo_disp.select('patient_id', 'encounter_id', 'age_at_admission', 'disposition')
+
+# Filter to adults only
+demo_disp = demo_disp.filter(f.col('age_at_admission')>=18)
+
+adults_in_time = limited_ids.join(demo_disp, on='encounter_id', how='inner')
+
+# Exclude people only in ER/OR
+adt = spark.read.parquet("RCLIF_adt.parquet")
+
+adult_ids = adults_in_time.select('encounter_id')
+adt_adults = adult_ids.join(adt, on='encounter_id', how='inner')
+adt_adults = adt_adults.select('encounter_id', 'location_name').distinct()
+adt_adults = adt_adults.withColumn('count', f.lit(1))
+adt_adults_wide = adt_adults.groupBy('encounter_id').pivot('location_name').agg(f.sum('count'))
+adt_adults_wide = adt_adults_wide.filter(f.col('ICU').isNotNull() |
+                                         f.col('null').isNotNull() |
+                                         f.col('Ward').isNotNull())
+adt_adults_wide = adt_adults_wide.select('encounter_id').distinct()
+
+adults_in_time = adt_adults_wide.join(adults_in_time, on='encounter_id', how='left')
+har_ids = adults_in_time.select('encounter_id', 'admission_dttm', 'discharge_dttm')
+
+## Explode between admission and discharge to get all hourly timestamps
+har_ids_hours = har_ids.withColumn('txnDt', f.explode(f.expr('sequence(admission_dttm, discharge_dttm, interval 1 hour)')))
+har_ids_hours = har_ids_hours.withColumn('meas_hour', f.hour(f.col('txnDt')))
+har_ids_hours = har_ids_hours.withColumn('meas_date', f.to_date(f.col('txnDt')))
+har_ids_hours = har_ids_hours.select('encounter_id', 'meas_date', 'meas_hour').orderBy('encounter_id', 'meas_date', 'meas_hour')
 
 ######### Get worst FiO2
+# Read in respiratory support table
+resp_full = spark.read.parquet('RCLIF_resp_support.parquet')
 
-## Read in respiratory support table
-resp_full = spark.read.option("header",True).csv('/project2/wparker/SIPA_data/RCLIF_respiratory_support_09282023.csv')
-resp_full = resp_full.withColumn('recorded_time',f.to_timestamp('recorded_time','yyyy-MM-dd HH:mm:ss'))
+# Filter to only adults in time frame
+resp_full = har_ids.join(resp_full, on='encounter_id', how='inner')
 
-resp_full = resp_full.withColumn("fio2",resp_full.fio2.cast('double'))
-resp_full = resp_full.withColumn("lpm",resp_full.lpm.cast('double'))
+# Filter to only variables we need
+resp_full = resp_full.select('encounter_id', 'recorded_time', 'device_name','lpm', 'fio2', 'peep', 'set_volume')
 
-
-## Filter for valid values or Null
+# Filter for valid values or Null
 resp_full = resp_full.filter((((f.col('fio2')>=0.21) &
                               (f.col('fio2')<=1)) |
                               (f.col('fio2').isNull())))
 
-## Filter out people on NIPPV without a FiO2 measurement--CPAP
-resp_full = resp_full.filter(~((f.col('device_name')=='NIPPV') &
-                              (f.col('fio2').isNull())))
+resp_full = resp_full.filter((((f.col('peep')>=3) &
+                              (f.col('peep')<=30)) |
+                              (f.col('peep').isNull())))
 
-## Replace NA/Null strings with actual Nulls
-resp_full = resp_full.withColumn('device_name', f.when(~f.col('device_name').rlike(r'NA'), f.col('device_name')))
-resp_full = resp_full.withColumn('device_name', f.when(~f.col('device_name').rlike(r'NULL'), f.col('device_name')))
+# Filter out people on CPAP with an FiO2 < 0.3
+resp_full = resp_full.filter(~((f.col('device_name')=="CPAP") &
+                             ((f.col('fio2').isNull()) | (f.col('fio2')<0.3))))
 
+
+# Try to fill in some of the null device names based on other values
 resp_full = resp_full.withColumn('device_name_2', f.expr(
         """
         CASE
         WHEN device_name IS NOT NULL THEN device_name
-        WHEN device_name IS NULL AND fio2 ==.21 AND lpm IS NULL and peep=='NA' THEN 'Room Air'
-        WHEN device_name IS NULL AND fio2 IS NULL AND lpm IS NULL THEN 'Room Air'
-        WHEN device_name IS NULL AND fio2 IS NULL AND lpm ==0 THEN 'Room Air'
-        WHEN device_name IS NULL AND fio2 IS NULL and lpm <=20 THEN 'Nasal Cannula'
-        WHEN device_name IS NULL AND fio2 IS NULL and lpm >20 and peep=='NA' THEN 'High Flow NC'
+        WHEN device_name IS NULL AND fio2 ==.21 AND lpm IS NULL AND peep IS NULL AND set_volume IS NULL THEN 'Room Air'
+        WHEN device_name IS NULL AND fio2 IS NULL AND lpm ==0 AND peep IS NULL AND set_volume IS NULL THEN 'Room Air'
+        WHEN device_name IS NULL AND fio2 IS NULL AND lpm <=20 AND peep IS NULL AND set_volume IS NULL THEN 'Nasal Cannula'
+        WHEN device_name IS NULL AND fio2 IS NULL AND lpm >20 AND peep IS NULL AND set_volume IS NULL THEN 'High Flow NC'
+        WHEN device_name == "Nasal Cannula" AND fio2 IS NULL AND lpm >20 THEN 'High Flow NC'
         ELSE NULL
         END
         """
 ))
 
+# Try to fill in FiO2 based on LPM for nasal cannula
 resp_full = resp_full.withColumn('fio2_combined', f.expr(
         """
         CASE
@@ -72,222 +120,218 @@ resp_full = resp_full.withColumn('fio2_combined', f.expr(
         """
 ))
 
-# Carry forward device & FiO2
+# Filter for valid values or Null
+resp_full = resp_full.filter((((f.col('fio2_combined')>=0.21) &
+                              (f.col('fio2_combined')<=1)) |
+                              (f.col('fio2_combined').isNull())))
 
-## Get first and last measurement times per person
-fio2_hours = fio2.select("C19_HAR_ID","meas_date").distinct()
-fio2_hours = fio2_hours.groupBy('C19_HAR_ID').agg((f.min('meas_date').alias("first_date")),
-                                               (f.max('meas_date').alias("last_date")))
 
-fio2_hours = fio2_hours.withColumn('first_date',f.to_timestamp('first_date','yyyy-MM-dd'))
-fio2_hours = fio2_hours.withColumn('last_date',f.to_timestamp('last_date','yyyy-MM-dd'))
+### Carry forward device & FiO2
 
-## Explode between first and last measurement times to get all hourly timestamps
-fio2_hours = fio2_hours.withColumn('txnDt', f.explode(f.expr('sequence(first_date, last_date, interval 1 hour)')))
-fio2_hours = fio2_hours.withColumn('meas_hour', f.hour(f.col('txnDt')))
-fio2_hours = fio2_hours.withColumn('meas_date', f.to_date(f.col('txnDt')))
-fio2_hours = fio2_hours.select('C19_HAR_ID', 'txnDt', 'meas_date', 'meas_hour')
-
-## Join to cohort max FiO2 
-group_cols = ["C19_HAR_ID", "meas_date", "meas_hour"]
-fio2_hours = fio2_hours.join(fio2, on=group_cols, how='left').orderBy('C19_HAR_ID', 'txnDt')
-
-## Extract hour and date for blocking
-resp_full = resp_full.select('C19_HAR_ID', 'device_name_2', 'recorded_time', 'fio2_combined', 'lpm')
+# Extract hour and date for blocking
+resp_full = resp_full.select('encounter_id', 'device_name_2', 'recorded_time', 'fio2_combined', 'lpm')
 resp_full = resp_full.withColumn('meas_hour', f.hour(f.col('recorded_time')))
 resp_full = resp_full.withColumn('meas_date', f.to_date(f.col('recorded_time')))
 
-fio2 = resp_full.select('C19_HAR_ID', 'device_name_2', 'meas_date', 'meas_hour', 'fio2_combined', 'lpm')
+fio2 = resp_full.select('encounter_id', 'device_name_2', 'meas_date', 'meas_hour', 'fio2_combined', 'lpm').distinct()
 
-## Group by person, device, measurement date and measurement hour; get max FiO2 and LPM within each hour
-group_cols = ["C19_HAR_ID", "device_name_2", "meas_date", "meas_hour"]
+# Need to rank devices to get max in hour
+fio2 = fio2.withColumn("device_rank", f.expr(
+        """
+        CASE
+        WHEN device_name_2 == 'Vent' THEN 1
+        WHEN device_name_2 == 'NIPPV' THEN 2
+        WHEN device_name_2 == 'CPAP' THEN 3
+        WHEN device_name_2 == 'High Flow NC' THEN 4
+        WHEN device_name_2 == 'Face Mask' THEN 5
+        WHEN device_name_2 == 'Trach Collar' THEN 6
+        WHEN device_name_2 == 'Nasal Cannula' THEN 7
+        WHEN device_name_2 == 'Other' THEN 8
+        WHEN device_name_2 == 'Room Air' THEN 9
+        WHEN device_name_2 IS NULL THEN NULL
+        ELSE NULL
+        END
+        """
+    ))
+
+# Group by person, device, measurement date and measurement hour; get max FiO2 and LPM within each hour
+group_cols = ["encounter_id", "meas_date", "meas_hour"]
 fio2 = fio2.groupBy(group_cols) \
             .agg((f.max('fio2_combined').alias("fio2_combined")),
-                  (f.max('lpm').alias("lpm")))
+                  (f.min('device_rank').alias("device_rank")),
+                  (f.max('lpm').alias("lpm"))).orderBy(group_cols)
+fio2 = fio2.withColumn("device_name", f.expr(
+        """
+        CASE
+        WHEN device_rank == 1 THEN 'Vent'
+        WHEN device_rank == 2 THEN 'NIPPV' 
+        WHEN device_rank == 3 THEN 'CPAP' 
+        WHEN device_rank == 4 THEN 'High Flow NC'
+        WHEN device_rank == 5 THEN 'Face Mask' 
+        WHEN device_rank == 6 THEN 'Trach Collar'
+        WHEN device_rank == 7 THEN 'Nasal Cannula'
+        WHEN device_rank == 8 THEN 'Other'
+        WHEN device_rank == 9 THEN 'Room Air'
+        WHEN device_rank IS NULL THEN NULL
+        ELSE NULL
+        END
+        """
+    ))
 
-## Left join back to only the encounters in the time frame
-fio2 = fio2.join(demo_disp, on='C19_HAR_ID', how='leftsemi')
 
-## Carry forward device name until another device is recorded or the end of the measurement time window
-fio2_hours_2 = fio2_hours.withColumn('device_filled', 
-                                       f.coalesce(f.col('device_name_2'), 
-                                                  f.last('device_name_2', True) \
-                                                  .over(Window.partitionBy('C19_HAR_ID') \
-                                                        .orderBy('txnDt')), f.lit('NULL')))
-fio2_hours_2 = fio2_hours_2.withColumn('device_filled', 
+# Merge back to hourly blocked cohort table 
+group_cols = ["encounter_id", "meas_date", "meas_hour"]
+fio2_hours = har_ids_hours.join(fio2, on=group_cols, how='left').orderBy(group_cols).distinct()
+
+
+# Carry forward device name until another device is recorded or the end of the measurement time window
+fio2_hours = fio2_hours.withColumn('device_filled', 
+                                       f.coalesce(f.col('device_name'), 
+                                                  f.last('device_name', True) \
+                                                  .over(Window.partitionBy('encounter_id') \
+                                                        .orderBy(group_cols)), f.lit('NULL')))
+fio2_hours = fio2_hours.withColumn('device_filled', 
                                        f.when(~f.col('device_filled').rlike(r'NULL'), f.col('device_filled')))
 
-## Carry forward FiO2 measurement name until another device is recorded or the end of the measurement time window
-fio2_hours_2 = fio2_hours_2.withColumn("fio2_combined",fio2_hours_2.fio2_combined.cast('double'))
+# Carry forward FiO2 measurement name until another device is recorded or the end of the measurement time window
+fio2_hours = fio2_hours.withColumn("fio2_combined",fio2_hours.fio2_combined.cast('double'))
 
-fio2_hours_2 = fio2_hours_2.withColumn('fio2_filled', 
+fio2_hours = fio2_hours.withColumn('fio2_filled', 
                                        f.when((f.col('fio2_combined').isNotNull()), f.col('fio2_combined')))
-fio2_hours_2 = fio2_hours_2.withColumn('fio2_filled', 
+fio2_hours = fio2_hours.withColumn('fio2_filled', 
                                        f.coalesce(f.col('fio2_combined'), 
                                                   f.last('fio2_combined', True) \
-                                                  .over(Window.partitionBy('C19_HAR_ID', 'device_filled') \
-                                                        .orderBy('txnDt')), f.lit('NULL')))
+                                                  .over(Window.partitionBy('encounter_id', 'device_filled') \
+                                                        .orderBy(group_cols)), f.lit('NULL')))
 
-fio2_filled = fio2_hours_2.select('C19_HAR_ID','txnDt','meas_date', 'meas_hour',
-                                  'device_filled','fio2_filled')
+# Carry forward LPM measurement name until another device is recorded or the end of the measurement time window
+fio2_hours = fio2_hours.withColumn("lpm",fio2_hours.lpm.cast('double'))
 
-# Now need PaO2
-labs = spark.read.parquet("/project2/wparker/SIPA_data/RCLIF_labs_10312023.parquet")
+fio2_hours = fio2_hours.withColumn('lpm_filled', 
+                                       f.when((f.col('lpm').isNotNull()), f.col('lpm')))
+fio2_hours = fio2_hours.withColumn('lpm_filled', 
+                                       f.coalesce(f.col('lpm'), 
+                                                  f.last('lpm', True) \
+                                                  .over(Window.partitionBy('encounter_id', 'device_filled') \
+                                                        .orderBy(group_cols)), f.lit('NULL')))
 
+fio2_filled = fio2_hours.select('encounter_id','meas_date', 'meas_hour',
+                                  'device_filled','fio2_filled', 'lpm_filled').distinct()
 
-### Cleaning up values/columns
-labs = labs.select('C19_HAR_ID', 'lab_result_time','lab_name', 'lab_value')
+######### Get worst PaO2
+labs = spark.read.parquet("RCLIF_labs.parquet")
 
+# Selecting only variables we need
+labs = labs.select('encounter_id', 'lab_result_time','lab_name', 'lab_value')
+
+# Cleaning up values
 select_expr = [f.regexp_replace(f.col('lab_name'), "[\ufeff]", "").alias('lab_name')]
-labs = labs.select('C19_HAR_ID', 'lab_result_time', 'lab_value', *select_expr)
-
-labs = labs.filter(f.col("lab_name")=="pao2")
-
-labs = labs.withColumn('lab_result_time',f.to_timestamp('lab_result_time','yyyy-MM-dd HH:mm:ss'))
-
-select_expr = [f.regexp_replace(f.col('lab_value'), "[\ufeff]", "").alias('lab_value')]
-labs = labs.select('C19_HAR_ID', 'lab_result_time', 'lab_name', *select_expr)
+labs = labs.select('encounter_id', 'lab_result_time', 'lab_value', *select_expr)
 
 select_expr = [f.regexp_replace(f.col('lab_value'), "[<]", "").alias('lab_value')]
-labs = labs.select('C19_HAR_ID', 'lab_result_time', 'lab_name', *select_expr)
+labs = labs.select('encounter_id', 'lab_result_time', 'lab_name', *select_expr)
 
 select_expr = [f.regexp_replace(f.col('lab_value'), "[>]", "").alias('lab_value')]
-labs = labs.select('C19_HAR_ID', 'lab_result_time', 'lab_name', *select_expr)
+labs = labs.select('encounter_id', 'lab_result_time', 'lab_name', *select_expr)
 
 labs = labs.withColumn('meas_hour', f.hour(f.col('lab_result_time')))
 labs = labs.withColumn('meas_date', f.to_date(f.col('lab_result_time')))
-labs = labs.select('C19_HAR_ID', 'meas_date', 'meas_hour', 'lab_name', 'lab_value')
-labs = labs.withColumn("lab_value_num",labs.lab_value.cast('double'))
 
+# Filtering to only adults in time period
+labs = labs.join(har_ids, on='encounter_id', how='inner')
+
+# Filtering to only valid arterial PaO2, formatting values
+pao2 = labs.filter(f.col("lab_name")=="pao2")
+pao2 = pao2.withColumn("lab_value",pao2.lab_value.cast('double'))
+pao2 = pao2.filter(f.col("lab_value")>30)
+pao2 = pao2.withColumn('lab_result_time',f.to_timestamp('lab_result_time','yyyy-MM-dd HH:mm:ss'))
 
 # Get min PaO2 per hour
-group_cols = ["C19_HAR_ID","meas_date", "meas_hour"]
-labs = labs.groupBy(group_cols) \
+pao2 = pao2.withColumn('meas_hour', f.hour(f.col('lab_result_time')))
+pao2 = pao2.withColumn('meas_date', f.to_date(f.col('lab_result_time')))
+pao2 = pao2.select('encounter_id', 'meas_date', 'meas_hour', 'lab_name', 'lab_value')
+
+group_cols = ["encounter_id","meas_date", "meas_hour"]
+pao2 = pao2.groupBy(group_cols) \
            .pivot("lab_name") \
-           .agg(f.min('lab_value_num').alias("min"))
-labs = labs.join(demo_disp, on='C19_HAR_ID', how='leftsemi')
+           .agg(f.min('lab_value').alias("min"))
 
-## Get first and last measurement times per person
-labs_hours = labs.select("C19_HAR_ID","meas_date").distinct()
-labs_hours = labs_hours.groupBy('C19_HAR_ID').agg((f.min('meas_date').alias("first_date")),
-                                               (f.max('meas_date').alias("last_date")))
+# Merge back to hourly blocked cohort table 
+group_cols = ["encounter_id", "meas_date", "meas_hour"]
+pao2_hours = har_ids_hours.join(pao2, on=group_cols, how='left').orderBy(group_cols).distinct()
 
-labs_hours = labs_hours.withColumn('first_date',f.to_timestamp('first_date','yyyy-MM-dd'))
-labs_hours = labs_hours.withColumn('last_date',f.to_timestamp('last_date','yyyy-MM-dd'))
+pao2_hours = pao2_hours.withColumn("dttm", f.concat(pao2_hours.meas_date, f.lit(" "), pao2_hours.meas_hour))
+pao2_hours = pao2_hours.withColumn('dttm',f.to_timestamp('dttm','yyyy-MM-dd HH'))
 
-## Explode between first and last measurement times to get all hourly timestamps
-labs_hours = labs_hours.withColumn('txnDt', f.explode(f.expr('sequence(first_date, last_date, interval 1 hour)')))
-labs_hours = labs_hours.withColumn('meas_hour', f.hour(f.col('txnDt')))
-labs_hours = labs_hours.withColumn('meas_date', f.to_date(f.col('txnDt')))
-labs_hours = labs_hours.select('C19_HAR_ID', 'txnDt', 'meas_date', 'meas_hour')
+# Carry forward PaO2 until next measurement or end of window, maximum 4 hours
 
-labs_hours = labs_hours.join(labs, on=group_cols, how='left').orderBy('C19_HAR_ID', 'txnDt')
-
-## Carry forward PaO2 until next measurement or end of window, maximum 4 hours
-
-### Get time of most recent PaO2
-labs_hours_2 = labs_hours.withColumn('last_measure', f.when(f.col('pao2').isNotNull(), f.col('txnDt')))
-labs_hours_2 = labs_hours_2.withColumn('last_measure', f.coalesce(f.col('last_measure'), 
+# Get time of most recent PaO2
+pao2_hours = pao2_hours.withColumn('last_measure', f.when(f.col('pao2').isNotNull(), f.col('dttm')))
+pao2_hours = pao2_hours.withColumn('last_measure', f.coalesce(f.col('last_measure'), 
                                                                   f.last('last_measure', True)\
-                                                                  .over(Window.partitionBy('C19_HAR_ID')\
-                                                                        .orderBy('txnDt')), f.lit('NULL')))
+                                                                  .over(Window.partitionBy('encounter_id')\
+                                                                        .orderBy('dttm')), f.lit('NULL')))
 
-labs_hours_2 = labs_hours_2.withColumn('last_measure',f.to_timestamp('last_measure','yyyy-MM-dd HH:mm:ss'))
-labs_hours_2 = labs_hours_2.withColumn('txnDt',f.to_timestamp('txnDt','yyyy-MM-dd HH:mm:ss'))
+pao2_hours = pao2_hours.withColumn('last_measure',f.to_timestamp('last_measure','yyyy-MM-dd HH:mm:ss'))
 
-### Calculate time difference between the hour we're trying to fill and the most recent PaO2, filter to only 4 hrs
-labs_hours_2 = labs_hours_2.withColumn("hour_diff", 
-                                       (f.col("txnDt").cast("long")-f.col("last_measure").cast("long"))/(60*60))
-labs_hours_2 = labs_hours_2.filter((f.col('hour_diff')>=0)&(f.col('hour_diff')<=3))
+# Calculate time difference between the hour we're trying to fill and the most recent PaO2, filter to only 3 additional hrs (4 total)
+pao2_hours = pao2_hours.withColumn("hour_diff", 
+                                       (f.col("dttm").cast("long")-f.col("last_measure").cast("long"))/(60*60))
+pao2_hours_2 = pao2_hours.filter((f.col('hour_diff')>=0)&(f.col('hour_diff')<=3))
 
-labs_hours_2 = labs_hours_2.withColumn("pao2_num",labs_hours_2.pao2.cast('double'))
-labs_hours_2 = labs_hours_2.filter(f.col('pao2_num')>0)
-
-### Fill PaO2 forward
-labs_hours_2 = labs_hours_2.withColumn('pao2_filled', f.when(f.col('pao2_num').isNotNull(), f.col('pao2_num')))
-labs_hours_2 = labs_hours_2.withColumn('pao2_filled', f.coalesce(f.col('pao2_num'), 
-                                                                 f.last('pao2_num', True)\
-                                                                 .over(Window.partitionBy('C19_HAR_ID', 
+# Fill PaO2 forward
+pao2_hours_2 = pao2_hours_2.withColumn('pao2_filled', f.when(f.col('pao2').isNotNull(), f.col('pao2')))
+pao2_hours_2 = pao2_hours_2.withColumn('pao2_filled', f.coalesce(f.col('pao2'), 
+                                                                 f.last('pao2', True)\
+                                                                 .over(Window.partitionBy('encounter_id', 
                                                                                           'last_measure')\
-                                                                       .orderBy('txnDt')), f.lit('NULL')))
+                                                                       .orderBy('dttm')), f.lit('NULL')))
 
-pao2_filled = labs_hours_2.select('C19_HAR_ID','txnDt','meas_date', 'meas_hour', 'pao2_filled')
+pao2_filled = pao2_hours_2.select('encounter_id','meas_date', 'meas_hour', 'pao2_filled')
 
-# Now need spO2
-vitals = spark.read.parquet("/project2/wparker/SIPA_data/RCLIF_vitals_10242023.parquet")
-vitals = vitals.withColumn('measured_time',f.to_timestamp('recorded_time','yyyy-MM-dd HH:mm:ss'))
-vitals = vitals.select('C19_HAR_ID', 'measured_time','vital_name', 'vital_value')
+######### Get worst SpO2
+vitals = spark.read.parquet("RCLIF_vitals.parquet")
+vitals = vitals.filter(f.col('vital_name').isNotNull())
+vitals = vitals.filter(f.col('vital_value').isNotNull())
+vitals = vitals.filter(f.col('vital_value')>0)
 
-vitals = vitals.filter(f.col("vital_name")=="spO2")
+# Filtering to only adults in time period
+vitals = vitals.join(har_ids, on='encounter_id', how='inner')
 
-vitals = vitals.withColumn('meas_hour', f.hour(f.col('measured_time')))
-vitals = vitals.withColumn('meas_date', f.to_date(f.col('measured_time')))
-vitals = vitals.select('C19_HAR_ID', 'meas_date', 'meas_hour', 'vital_name', 'vital_value')
+# Selecting variables we need
+vitals = vitals.select('encounter_id', 'recorded_time','vital_name', 'vital_value')
+vitals = vitals.withColumn('meas_hour', f.hour(f.col('recorded_time')))
+vitals = vitals.withColumn('meas_date', f.to_date(f.col('recorded_time')))
+
+# Filtering to only SpO2, valid values
+spo2 = vitals.filter(f.col("vital_name")=="spO2")
+spo2 = spo2.select('encounter_id', 'meas_date', 'meas_hour', 'vital_name', 'vital_value')
+spo2 = spo2.filter(f.col('vital_value')>=60)
+spo2 = spo2.filter(f.col('vital_value')<=96)
 
 # Get min SpO2 per hour
-
-group_cols = ["C19_HAR_ID","meas_date", "meas_hour"]
-vitals = vitals.groupBy(group_cols) \
+group_cols = ["encounter_id","meas_date", "meas_hour"]
+spo2 = spo2.groupBy(group_cols) \
            .pivot("vital_name") \
            .agg(f.min('vital_value').alias("min"))
-vitals = vitals.join(demo_disp, on='C19_HAR_ID', how='leftsemi')
 
-## Get first and last measurement times per person
-vitals_hours = vitals.select("C19_HAR_ID","meas_date").distinct()
-vitals_hours = vitals_hours.groupBy('C19_HAR_ID').agg((f.min('meas_date').alias("first_date")),
-                                               (f.max('meas_date').alias("last_date")))
-
-vitals_hours = vitals_hours.withColumn('first_date',f.to_timestamp('first_date','yyyy-MM-dd'))
-vitals_hours = vitals_hours.withColumn('last_date',f.to_timestamp('last_date','yyyy-MM-dd'))
-
-## Explode between first and last measurement times to get all hourly timestamps
-vitals_hours = vitals_hours.withColumn('txnDt', f.explode(f.expr('sequence(first_date, last_date, interval 1 hour)')))
-vitals_hours = vitals_hours.withColumn('meas_hour', f.hour(f.col('txnDt')))
-vitals_hours = vitals_hours.withColumn('meas_date', f.to_date(f.col('txnDt')))
-vitals_hours = vitals_hours.select('C19_HAR_ID', 'txnDt', 'meas_date', 'meas_hour')
-
-vitals_hours = vitals_hours.join(vitals, on=group_cols, how='left').orderBy('C19_HAR_ID', 'txnDt')
-
-
-vitals_hours_2 = vitals_hours.withColumn('last_measure', f.when(f.col('spO2').isNotNull(), f.col('txnDt')))
-vitals_hours_2 = vitals_hours_2.withColumn('last_measure', 
-                                           f.coalesce(f.col('last_measure'), 
-                                                      f.last('last_measure', True)\
-                                                      .over(Window.partitionBy('C19_HAR_ID')\
-                                                            .orderBy('txnDt')), f.lit('NULL')))
-
-vitals_hours_2 = vitals_hours_2.withColumn('last_measure',f.to_timestamp('last_measure','yyyy-MM-dd HH:mm:ss'))
-vitals_hours_2 = vitals_hours_2.withColumn('txnDt',f.to_timestamp('txnDt','yyyy-MM-dd HH:mm:ss'))
-
-## Get only valid values before filling
-vitals_hours_2 = vitals_hours_2.withColumn("spO2_num",vitals_hours_2.spO2.cast('double'))
-vitals_hours_2 = vitals_hours_2.filter(f.col('spO2_num')>60)
-vitals_hours_2 = vitals_hours_2.filter(f.col('spO2_num')<=100)
-
-## Cary forward SpO2
-vitals_hours_2 = vitals_hours_2.withColumn('spO2_filled', 
-                                           f.when(f.col('spO2_num').isNotNull(), f.col('spO2_num')))
-vitals_hours_2 = vitals_hours_2.withColumn('spO2_filled', 
-                                           f.coalesce(f.col('spO2_num'), 
-                                                      f.last('spO2_num', True)\
-                                                      .over(Window.partitionBy('C19_HAR_ID', 'last_measure')\
-                                                            .orderBy('txnDt')), f.lit('NULL')))
-
-spO2_filled = vitals_hours_2.select('C19_HAR_ID','txnDt','meas_date', 'meas_hour', 'spO2_filled')
+# Merge back to hourly blocked cohort table 
+group_cols = ["encounter_id", "meas_date", "meas_hour"]
+spo2_hours = har_ids_hours.join(spo2, on=group_cols, how='left').distinct()
+spo2_hours = spo2_hours.select('encounter_id','meas_date', 'meas_hour', 'spO2')
 
 # Merge FiO2, PaO2, spO2 to get FiO2/PaO2
+fio2_filled = fio2_filled.repartition('encounter_id')
+pao2_filled = pao2_filled.repartition('encounter_id')
+spo2_hours = spo2_hours.repartition('encounter_id')
 
-fio2_filled = fio2_filled.repartition('C19_HAR_ID')
-pao2_filled = pao2_filled.repartition('C19_HAR_ID')
-spO2_filled = spO2_filled.repartition('C19_HAR_ID')
-
-group_cols = ["C19_HAR_ID","txnDt","meas_date", "meas_hour"]
-df = fio2_filled.join(pao2_filled, on=group_cols, how='full')
-df = df.join(spO2_filled, on=group_cols, how='full')
+group_cols = ["encounter_id","meas_date", "meas_hour"]
+df = fio2_filled.join(pao2_filled, on=group_cols, how='left')
+df = df.join(spo2_hours, on=group_cols, how='left').orderBy(group_cols)
 
 df = df.withColumn("fio2_filled",df.fio2_filled.cast('double'))
 df = df.withColumn("pao2_filled",df.pao2_filled.cast('double'))
-df = df.withColumn("spO2_filled",df.spO2_filled.cast('double'))
+df = df.withColumn("lpm_filled",df.lpm_filled.cast('double'))
 
 # Get first time on oxygen support & P/F <200
 df = df.withColumn("p_f", f.expr(
@@ -302,83 +346,125 @@ df = df.withColumn("p_f", f.expr(
 df = df.withColumn("s_f", f.expr(
         """
         CASE
-        WHEN fio2_filled IS NOT NULL AND spO2_filled IS NOT NULL THEN ( spO2_filled / fio2_filled )
+        WHEN fio2_filled IS NOT NULL AND spO2 IS NOT NULL THEN ( spO2 / fio2_filled )
         ELSE NULL
         END
         """
     ))
 
 df = df.distinct()
-df.write.parquet("/project2/wparker/SIPA_data/p_f_combined_filled.parquet", mode="overwrite")
 
-## Get first time somone on oxygen therapy with PaO2/FiO2 < 200 (S/F < 179 if no P/F measured)
-
-df = df.filter((((f.col("p_f")<200))|
-                (f.col("s_f")<179)))
-df = df.filter(f.col("device_filled")!="NULL")
-df = df.filter(f.col("device_filled")!="Room Air")
-df = df.filter(f.col("device_filled")!="Vent")
-df = df.filter(f.col("device_filled")!="NIPPV")
-df = df.filter(f.col("device_filled").isNotNull())
-
-
-df = df.select("C19_HAR_ID", "txnDt", "meas_date", "meas_hour", "device_filled","pao2_filled","fio2_filled",
-              "spO2_filled")
-
-w1 = Window.partitionBy("C19_HAR_ID").orderBy('txnDt')
-
-df_first_with_time = df.withColumn("row",f.row_number().over(w1)) \
-             .filter(f.col("row") == 1).drop("row")
-
-df_first_with_time = df_first_with_time.select("C19_HAR_ID", "txnDt").withColumnRenamed("txnDt", "recorded_time")
-
-#get just invasive or non-invasive mechanical ventilation
-vent = resp_full.filter(((f.col('device_name')=='Vent') | 
-                   (f.col('device_name')=='NIPPV')))
-
-# minimum time by person
-
-w3 = Window.partitionBy("C19_HAR_ID").orderBy('recorded_time')
-
-vent_first = vent.withColumn("row",f.row_number().over(w3)) \
-             .filter(f.col("row") == 1).drop("row")
-
-# Merge with oxygen support and P/F < 200 group, get first time meeting criteria
-vent_first = vent_first.repartition('C19_HAR_ID')
-df_first_with_time = df_first_with_time.repartition('C19_HAR_ID')
-
-group_cols = ["C19_HAR_ID","recorded_time"]
-df = vent_first.join(df_first_with_time, on=group_cols, how='full')
-
-resp_support = df.groupBy("C19_HAR_ID").agg(f.min("recorded_time").alias("resp_life_support_start")).distinct()
-
-# Now pressors
-df_meds = spark.read.option("header",True).csv('/project2/wparker/SIPA_data/RCLIF_meds_admin_conti.csv')
-df_meds = df_meds.withColumn('admin_time',f.to_timestamp('admin_time','yyyy-MM-dd HH:mm:ss'))
+############ Get number of pressors on per hour
+df_meds = spark.read.parquet('RCLIF_medication_admin_continuous.parquet')
+df_meds = df_meds.withColumn('meas_hour', f.hour(f.col('admin_dttm')))
+df_meds = df_meds.withColumn('meas_date', f.to_date(f.col('admin_dttm')))
 
 # Filter to pressor medications
+pressors = df_meds.filter(f.col('med_category')=='vasoactives')
+pressors = pressors.select("encounter_id", "meas_hour", "meas_date", "med_name").distinct()
 
-pressors = df_meds.filter(((f.col('med_name')=='phenylephrine') | 
-                       (f.col('med_name')=='epinephrine') | 
-                       (f.col('med_name')=='vasopressin') | 
-                       (f.col('med_name')=='dopamine') |
-                       (f.col('med_name')=='dobutamine') |
-                       (f.col('med_name')=='norepinephrine') |
-                       (f.col('med_name')=='angiotensin') |
-                       (f.col('med_name')=='isoproterenol')|
-                        (f.col('med_name')=='milrinone')))
-pressors = pressors.select("C19_HAR_ID", "admin_time")
+# Filtering to only adults in time period
+pressors = pressors.join(har_ids, on='encounter_id', how='inner')
 
-# Get first time someone is on a pressor
-pressors = pressors.groupBy("C19_HAR_ID").agg(f.min("admin_time").alias("pressor_life_support_start"))
-pressors = pressors.join(demo_disp, on='C19_HAR_ID', how='leftsemi').distinct()
+# Get max num pressors (cap at 4) per hour
+w2 = Window.partitionBy(group_cols).orderBy("med_name")
 
-df = pressors.join(resp_support, on='C19_HAR_ID', how='full')
-df = df.withColumn("life_support_start", f.least(f.col('pressor_life_support_start'),
-                                                 f.col('resp_life_support_start')))
-df = df.select('C19_HAR_ID', 'life_support_start')
-df = df.join(demo_disp, on='C19_HAR_ID', how='inner').orderBy('adm_date').distinct()
-df = df.filter(f.col('life_support_start').isNotNull())
+group_cols = ['encounter_id','meas_hour','meas_date', 'med_name']
 
-df.write.parquet("/project2/wparker/SIPA_data/life_support_cohort.parquet", mode="overwrite")
+cohort_pressors_grouped = pressors.withColumn("row",f.row_number().over(w2))
+cohort_pressors_grouped = pressors.withColumn("count",f.lit(1))
 
+group_cols = ["encounter_id",'meas_date', 'meas_hour']
+cohort_pressors_grouped = cohort_pressors_grouped.groupBy(group_cols) \
+                                     .pivot("med_name") \
+                                     .agg(f.count('count').alias("count")).orderBy(group_cols)
+
+cohort_pressors_grouped = cohort_pressors_grouped.withColumn("dobutamine_alone", f.expr(
+        """
+        CASE
+        WHEN dobutamine IS NOT NULL AND dopamine IS NULL AND epinephrine IS NULL AND isoproterenol IS NULL AND milrinone IS NULL AND norepinephrine IS NULL AND phenylephrine IS NULL AND vasopressin IS NULL THEN 1
+        ELSE 0
+        END
+        """
+    ))
+
+col_list = ['dobutamine', 'dopamine', 'epinephrine', 'isoproterenol', 'milrinone', 'norepinephrine', 'phenylephrine', 'vasopressin']
+cohort_pressors_grouped = cohort_pressors_grouped.na.fill(0, subset=col_list)
+cohort_pressors_grouped = cohort_pressors_grouped.withColumn('num_pressors', sum([f.col(c) for c in col_list]))
+
+cohort_pressors_grouped = cohort_pressors_grouped.withColumn("num_pressors", f.expr(
+        """
+        CASE
+        WHEN num_pressors > 4 THEN 4
+        ELSE num_pressors
+        END
+        """
+    ))
+cohort_pressors_grouped = cohort_pressors_grouped.select('encounter_id', 'meas_date', 'meas_hour', 'num_pressors', 'dobutamine_alone')
+
+# Merge back to hourly blocked cohort table 
+group_cols = ["encounter_id", "meas_date", "meas_hour"]
+pressor_hours = har_ids_hours.join(cohort_pressors_grouped, on=group_cols, how='left')\
+        .orderBy(group_cols)\
+        .select("encounter_id", "meas_date", "meas_hour", "num_pressors", "dobutamine_alone")\
+        .distinct()
+
+# Merge back to resp support hourly table
+df = df.join(pressor_hours, on=group_cols, how="left")
+
+# Flag if on life support in an hour
+df = df.withColumn("on_life_support", f.expr(
+        """
+        CASE
+        WHEN num_pressors >=1 THEN 1
+        WHEN device_filled == 'NIPPV' THEN 1
+        WHEN device_filled == 'Vent' THEN 1
+        WHEN  p_f < 200 THEN 1
+        WHEN s_f < 179 THEN 1
+        ELSE 0
+        END
+        """
+    ))
+
+# Create leading flags to identify first episode of 6 consectutive hrs of life support
+ls_df = df.orderBy(group_cols)
+ls_df = ls_df.withColumn("lead_1", f.lead(f.col("on_life_support"),1).over(Window.partitionBy("encounter_id").orderBy(group_cols)))
+ls_df = ls_df.withColumn("lead_2", f.lead(f.col("on_life_support"),2).over(Window.partitionBy("encounter_id").orderBy(group_cols)))
+ls_df = ls_df.withColumn("lead_3", f.lead(f.col("on_life_support"),3).over(Window.partitionBy("encounter_id").orderBy(group_cols)))
+ls_df = ls_df.withColumn("lead_4", f.lead(f.col("on_life_support"),4).over(Window.partitionBy("encounter_id").orderBy(group_cols)))
+ls_df = ls_df.withColumn("lead_5", f.lead(f.col("on_life_support"),5).over(Window.partitionBy("encounter_id").orderBy(group_cols)))
+
+col_list = ['on_life_support', 'lead_1', 'lead_2', 'lead_3', 'lead_4', 'lead_5']
+
+ls_df = ls_df.withColumn('life_support_sum', sum([f.col(c) for c in col_list]))
+
+# Get time first episode of 6 consectutive hrs of life support started
+ls_encs = ls_df.filter(f.col('life_support_sum')==6).select('encounter_id', 'meas_date', 'meas_hour')
+ls_encs = ls_encs.withColumn("life_support_start", f.concat(ls_encs.meas_date, f.lit(" "), ls_encs.meas_hour))
+ls_encs = ls_encs.withColumn('life_support_start',f.to_timestamp('life_support_start','yyyy-MM-dd HH'))
+ls_encs = ls_encs.groupBy('encounter_id').agg(f.min('life_support_start').alias("life_support_start"))
+
+ls_encs = ls_encs.withColumn('window_start', (f.col('life_support_start')-f.expr("INTERVAL 42 HOURS")))
+ls_encs = ls_encs.withColumn('window_end', (f.col('life_support_start')+f.expr("INTERVAL 5 HOURS")))
+ls_encs = ls_encs.select('encounter_id', 'life_support_start', 'window_start', 'window_end')
+
+# Explode between window start and window end to get all hourly timestamps
+ls_encs_hours = ls_encs.withColumn('txnDt', f.explode(f.expr('sequence(window_start, window_end, interval 1 hour)')))
+ls_encs_hours = ls_encs_hours.withColumn('meas_hour', f.hour(f.col('txnDt')))
+ls_encs_hours = ls_encs_hours.withColumn('meas_date', f.to_date(f.col('txnDt')))
+ls_encs_hours = ls_encs_hours.select('encounter_id', 'life_support_start', 'meas_date', 'meas_hour', 'window_start', 'window_end').orderBy('encounter_id', 'meas_date', 'meas_hour')
+
+# Re-join age at admission and disposition, admission & discharge dttm, and zip
+
+ls_encs_hours = ls_encs_hours.repartition('encounter_id')
+limited_ids = limited_ids.repartition('encounter_id')
+demo_disp = demo_disp.repartition('encounter_id')
+df = df.repartition('encounter_id')
+
+cohort_blocked = ls_encs_hours.join(limited_ids, on='encounter_id', how='left')
+cohort_blocked = cohort_blocked.join(demo_disp, on='encounter_id', how='left')
+
+group_cols = ["encounter_id", "meas_date", "meas_hour"]
+cohort_blocked = cohort_blocked.join(df, on=group_cols, how='left')
+
+cohort_blocked.repartition(1).write.csv("sipa_life_support_cohort.csv", mode='overwrite', header="true")

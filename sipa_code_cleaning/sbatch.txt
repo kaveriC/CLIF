@@ -8,8 +8,9 @@
 
 module load python/anaconda-2022.05
 source activate pyspark_env
-module load java
+module load java/15.0.2
 module load spark
+cd "/project2/wparker/SIPA_data/"
 
 python /home/rbaccile/Desktop/clif/CLIF/sipa_code_cleaning/cohort_identification.py
 python /home/rbaccile/Desktop/clif/CLIF/sipa_code_cleaning/worst_labs_48.py
