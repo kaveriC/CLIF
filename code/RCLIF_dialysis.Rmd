@@ -1,0 +1,175 @@
+---
+title: "RCLIF_dialysis"
+author: "Rachel Baccile"
+date: "2024-03-07"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(boxr)
+library(survival)
+library(bigreadr)
+library(digest)
+memory.limit(size = 30000)
+```
+
+# Pull Data from Box
+
+These credentials come from a unique "interactive" box app that each user should create with their specific UCMC box login credentials, see [ vignette for how to use boxr](https://cran.r-project.org/web/packages/boxr/vignettes/boxr.html). These
+specific ID and secret values have been loaded from a RData file that is not pushed
+to GitHub.
+```{r box_connection}
+# load("hidden_codes.RData")
+# boxr::box_fresh_auth()
+box_auth(client_id = "8tiw6nuhzopcfgef9s9366lusndc0hf1", 
+         client_secret = "WhxifwX8DVszZ8YNGufvMhKASeWxn3dg")
+```
+
+## Load data
+
+```{r load_flow_io_data, eval = FALSE}
+flow_io <- box_search("C19_FLOW_IO_LDS.txt") %>% box_read()
+```
+
+## Filter to only dialysis related measurements
+```{r filter_dialysis, eval = FALSE}
+
+dialysis <- flow_io %>%
+  filter(flo_meas_name %like% "DIALYSIS") %>%
+  distinct()
+rm(flow_io)
+dialysis <- as.data.frame(dialysis)
+```
+
+# CRRT in RCLIF format
+CRRT "Actual Fluid Removed (mL)" and "Fluid Delivered (L/Hr)" are documented every hour. CRRT starts 1 hour before "Actual Fluid Removed (mL)" and "Fluid Delivered (L/Hr)" are documented. CRRT ends at last "Actual Fluid Removed (mL)" and "Fluid Delivered (L/Hr)" documentation.
+```{r crrt, eval = FALSE}
+
+crrt_df <- dialysis %>% filter(flo_group_name=="Actual Fluid Removed (mL)" |
+                                 flo_group_name=="Fluid Delivered (L/Hr)") %>%
+                        select(C19_HAR_ID, flo_group_name, recorded_time, meas_value)
+
+
+crrt_df_times <-  crrt_df %>%
+                        select(C19_HAR_ID, recorded_time) %>%
+                        distinct() %>%
+                        group_by(C19_HAR_ID) %>%
+                        arrange(C19_HAR_ID, recorded_time) %>%
+                        mutate(start_time = recorded_time - hours(1)) %>%
+                        distinct()
+colnames(crrt_df_times) <- c("encounter_id", "stop_time", "start_time") 
+
+removal_crrt <- crrt_df %>%
+                    filter(flo_group_name=="Actual Fluid Removed (mL)")%>%
+                    select(C19_HAR_ID, meas_value, recorded_time) %>% 
+                    distinct()
+colnames(removal_crrt) <- c("encounter_id", "ultrafiltration_amount", "stop_time") 
+
+filtrate_crrt <- crrt_df %>%
+                    filter(flo_group_name=="Fluid Delivered (L/Hr)")%>%
+                    select(C19_HAR_ID, meas_value, recorded_time) %>% 
+                    distinct()
+colnames(filtrate_crrt) <- c("encounter_id", "dialysate_flow_amount", "stop_time") 
+
+
+crrt_df_clif <- left_join(crrt_df_times, filtrate_crrt)
+crrt_df_clif <- left_join(crrt_df_clif, removal_crrt)
+crrt_df_clif$dialysis_type <- "crrt"
+
+crrt_df_clif <- crrt_df_clif %>% select("encounter_id","dialysis_type", "start_time", "stop_time", "dialysate_flow_amount", "ultrafiltration_amount")
+```
+
+# Intermittent HD in CLIF format
+Intermittent HD starts when "Machine Number" is documented. Intermittent HD ends at next documentation of "aUltra Filtration Net Loss".
+```{r int, eval = FALSE}
+
+int_df <- dialysis %>% filter(flo_group_name=="aUltra Filtration Net Loss" |
+                                flo_group_name=="Machine Number") %>%
+                      select(C19_HAR_ID, flo_group_name, recorded_time, meas_value)
+int_df_times <-  int_df %>%
+                      filter(flo_group_name=="aUltra Filtration Net Loss" |
+                               flo_group_name=="Machine Number") %>%
+                      select(C19_HAR_ID, flo_group_name, recorded_time) %>%
+                      distinct() %>%
+                      group_by(C19_HAR_ID) %>%
+                      arrange(C19_HAR_ID, recorded_time) %>%
+                      mutate(stop_time = lead(recorded_time)) %>%
+                      filter(flo_group_name=="Machine Number") %>%
+                      select(C19_HAR_ID, recorded_time, stop_time)
+colnames(int_df_times) <- c("encounter_id", "start_time", "stop_time") 
+
+removal_int <- int_df %>%
+                filter(flo_group_name=="aUltra Filtration Net Loss")%>%
+                select(C19_HAR_ID, meas_value, recorded_time) %>% 
+                distinct()
+colnames(removal_int) <- c("encounter_id", "ultrafiltration_amount", "stop_time") 
+
+
+int_df_clif <- left_join(int_df_times, removal_int)
+int_df_clif$dialysis_type <- "intermittent"
+
+int_df_clif <- int_df_clif %>% select("encounter_id","dialysis_type", "start_time", "stop_time", "ultrafiltration_amount")
+```
+
+
+
+# Peritoneal Dialysis in CLIF format
+Peritoneal Dialysis starts when "Initial Drain" or "Fill Volume" is documented. Peritoneal Dialysis ends at next documentation of "Total Ultrafiltration".
+
+```{r peri, eval = FALSE}
+peri_df_all <- dialysis %>% filter(flo_group_name=="Total Ultrafiltration"|
+                                 flo_group_name=="Initial Drain" | flo_group_name=="Fill Volume") %>%
+                        select(C19_HAR_ID, flo_group_name, recorded_time, meas_value) %>% 
+                        distinct()
+removal_peri <- peri_df_all %>%
+                filter(flo_group_name=="Total Ultrafiltration"| flo_group_name=="Manual Exchange (Output)")%>%
+                select(C19_HAR_ID, meas_value, recorded_time) %>% 
+                filter(meas_value!=0) %>%
+                distinct()
+
+peri_df_start <-  peri_df_all %>%
+                    filter(flo_group_name=="Initial Drain" | flo_group_name=="Fill Volume") %>%
+                    select(C19_HAR_ID, flo_group_name, recorded_time) %>%
+                    distinct() %>%
+                    group_by(C19_HAR_ID) %>%
+                    arrange(C19_HAR_ID, recorded_time) %>%
+                    select(C19_HAR_ID, recorded_time) %>%
+                    distinct()
+
+peri_df_times <- bind_rows(peri_df_start, removal_peri)%>%
+            arrange(C19_HAR_ID, recorded_time) %>%
+            group_by(C19_HAR_ID) %>%
+            mutate(stop_time = lead(recorded_time)) %>%
+                    select(C19_HAR_ID, recorded_time, stop_time)
+colnames(peri_df_times) <- c("encounter_id", "start_time", "stop_time") 
+colnames(removal_peri) <- c("encounter_id", "ultrafiltration_amount", "stop_time") 
+
+
+peri_df_clif <- left_join(peri_df_times, removal_peri) %>% filter(!is.na(stop_time))
+peri_df_clif$dialysis_type <- "peritoneal"
+```
+
+# Merge all dialysis types for RCLIF_dialysis
+```{r merge, eval = FALSE}
+
+rclif_dialysis <- bind_rows(crrt_df_clif, int_df_clif)
+rclif_dialysis <- bind_rows(rclif_dialysis, peri_df_clif)
+```
+
+# Sanity Checks
+
+```{r check, eval = FALSE}
+test <- rclif_dialysis %>% select(start_time, dialysis_type, encounter_id)
+test$date <- as.Date(test$start_time)
+test <- test %>% select(date, dialysis_type, encounter_id) %>% distinct()
+
+test$year <- year(test$date)
+test <- test %>% group_by(year, dialysis_type) %>% tally()
+```
+
+# Write data
+```{r check, eval = FALSE}
+write_parquet(rclif_dialysis, "RCLIF_dialysis.parquet")
+write_csv(rclif_dialysis, "RCLIF_dialysis.csv")
+```
